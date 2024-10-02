@@ -1,0 +1,436 @@
+---
+title: "Modeling High-Strike Red Sox Pitchers vs Yankees"
+author: "Maysen Pagan"
+date: "December 12, 2023"
+output: 
+  bookdown::pdf_document2:
+    toc: false
+urlcolor: blue
+---
+
+```{r, echo = FALSE}
+#libraries
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(nnet))
+suppressPackageStartupMessages(library(rstanarm))
+suppressPackageStartupMessages(library(lme4))
+suppressPackageStartupMessages(library(kableExtra))
+suppressPackageStartupMessages(library(gridExtra))
+suppressPackageStartupMessages(library(reshape2))
+suppressPackageStartupMessages(library(flexmix))
+```
+
+# Introduction
+
+The Red Sox-Yankees rivalry is known to be the oldest and most famous Major League Baseball (MLB) rivalry dating back to the early 1900s. How well do the Red Sox perform against their biggest rival? The all-time record of these two teams playing each other has the Yankees winning about 200 more games than the Red Sox in the regular season. In this project, I seek to analyze the performance of the Red Sox pitchers against the Yankees by modeling the probability of a pitcher throwing a high proportion of strikes against a particular batter. Using this model, it may be possible to determine what pitchers should pitch against the Yankees as well as what types of pitches should be thrown to certain batters.
+
+It is widely known that statistics plays a huge role in optimizing MLB team performance. Many researchers use machine learning techniques and random forests to answer baseball questions. In one [article](https://assets-global.website-files.com/5f1af76ed86d6771ad48324b/5f6d38971aa75c2f6af77911_Predicting-Major-League-Baseball-Strikeout-Rates-Update.pdf), the author compared many models like random forest, neural network, and support vector machine to predict player strikeout rates which produced predictions with low error rates. In this analysis, I see how different logistic regression models compare.
+
+Note: Throughout this report, I use the term high-strike and low-strike. High-strike or high strike proportion refers to an bat in which the proportion of strikes thrown by a Red Sox pitcher was greater than or equal to 0.5. Low strike refers to an at bat in which the proportion of strikes thrown by a Red Sox pitcher was less than 0.5. 
+
+# Data Cleaning and Organization
+
+```{r, echo = FALSE}
+#load data
+pitch <- read.csv("~/Desktop/MSSP/Fall/MA 678/Final/pitch.csv")
+#move pitcher and batter columns up one
+pitch <- pitch %>% mutate_at(c("Pitcher"), tibble::lst("Pitcher"=lead), n = 1)
+pitch <- pitch %>% mutate_at(c("Batter"), tibble::lst("Batter"=lead), n = 1)
+
+pitch <- pitch[,-c(2,4)]
+#remove NA rows
+pitch <- pitch %>% na.omit()
+```
+
+```{r, echo = FALSE}
+#replace arrows of vertical and horizontal break with up, down, left, right
+pitch$X.2 <- ifelse(pitch$X.2=="↓", "down", "up")
+pitch$X.3 <- ifelse(pitch$X.3=="←", "left",
+                    ifelse(pitch$X.3=="→", "right",""))
+pitch <- pitch %>% select(-1)
+```
+
+```{r, echo = FALSE}
+#rename columns
+data <- pitch
+colnames(data) <- c("pitcher", "batter", "game.pitch", "pitcher.pitch", "plate.app", "inning", "pitcher.result", "pitch.type", "velo", "spin", "vbreak", "vbreak.direc", "hbreak", "hbreak.direc")
+
+#rename row names
+row.names(data) <- seq(1:nrow(data))
+```
+
+The data used in this project was taken from the [Baseball Savant](https://baseballsavant.mlb.com) website. Pitch by pitch data was aggregated for every Red Sox game against the Yankees from the 2023 season. This produces a data set with 3,809 rows representing 3,809 pitches and 16 columns. The first few rows of the data can be viewed in Table 1 and a description of the variables are below.
+
+`pitcher`: name of the pitcher \
+`batter`: name of the batter \
+`game.pitch`: number of the pitch thrown in whole game \
+`pitcher.pitch`: number of the pitch thrown by corresponding pitcher in a game \
+`plate.app`: number plate appearance in a game \
+`inning`: inning pitch was thrown in \
+`pitcher.result`: result of pitch thrown \
+`pitch.type`: type of pitch thrown \
+`velo`: velocity of pitch thrown (in miles per hour) \
+`spin`: spin rate of pitch thrown (in revolutions per minute) \
+`vbreak`: vertical break of pitch thrown (in inches) \
+`vbreak.direc`: direction of vertial break of pitch (upward or downward) \
+`hbreak`: horizontal break of pitch thrown (in inches) \
+`hbreak.direc`: direction of horizontal break of pitch (left or right) \
+
+```{r, echo = FALSE}
+head(data) %>% select(1:7) %>% 
+  kable(format = "latex", booktabs = TRUE, caption = "First 6 rows of dataset") %>% 
+  kable_styling(latex_options="scale_down") %>% 
+  kable_classic(html_font = "Cambria")
+
+head(data) %>% select(8:14) %>% 
+  kable(format = "latex", booktabs = TRUE) %>% 
+  kable_styling(font_size = 11) %>% 
+  kable_classic(html_font = "Cambria")
+
+```
+
+```{r, echo = FALSE}
+#add team name of pitcher to pitch data
+sox <- c("Kenley Jansen", "Chris Martin", "Nick Pivetta", "Garrett Whitlock", "Josh Winckowski", "Brennan Bernardino",
+         "Tanner Houck", "Brayan Bello", "Corey Kluber", "Joe Jacques", "Chris Murphy", "Kaleb Ort", "Mauricio Llovera",
+         "John Schreiber", "Kutter Crawford", "Nick Robertson", "Zack Weiss", "Brandon Walter")
+yanks <- c("Jimmy Cordero", "Nick Ramirez", "Albert Abreu", "Gerrit Cole", "Clay Holmes", "Tommy Kahnle",
+           "Wandy Peralta", "Domingo German", "Ron Marinaccio", "Michael King", "Clarke Schmidt", "Isiah Kiner-Falefa",
+           "Matt Krook", "Greg Weissert", "Luis Severino", "Keynan Middleton", "Ian Hamilton", "Jhony Brito", 
+           "Jonathan Loaisiga", "Randy Vasquez", "Matt Bowman", "Anthony Misiewicz", "Zach McAllister", "Carlos Rodon")
+
+data$team <- ifelse(data$pitcher%in%sox, "Red Sox", "Yankees")
+data <- data %>% select('team', everything())
+
+#team the batter is on
+#if pitcher is on red sox, batter is on yankees
+#exit$Team <- ifelse(exit$Pitcher%in%sox, "Yankees", "Red Sox")
+```
+
+
+```{r, echo = FALSE}
+#SWINGING STRIKE AND CALLED STRIKE WILL BE THE STRIKES, EVERYTHING ELSE IS NOT A STRIKE
+#create new binary column `result` that is 1 if strike and 0 if not
+data <- data %>% mutate(result = ifelse(data$pitcher.result == "Swinging Strike" | 
+                                          data$pitcher.result == "Called Strike" |
+                                          data$pitcher.result == "Foul" |
+                                          data$pitcher.result == "Foul Tip" |
+                                          data$pitcher.result == "Foul Bunt" |
+                                          data$pitcher.result == "Missed Bunt",
+                                        1, 0)) %>% 
+  select("team", "pitcher", "batter", "result", everything())
+```
+
+To prepare the data for analysis and modeling, a few columns were added to the dataset. The column `team` was added taking on the value "Red Sox" or "Yankees" corresponding to the team of the pitcher. The data was then filtered to include only those rows where `team` was equal to "Red Sox" (only pitches thrown by the Red Sox). This new dataset now with 1,880 rows was then merged with two other datasets containing the [wins above replacement](https://www.mlb.com/glossary/advanced-stats/wins-above-replacement) (WAR) of the Red Sox pitchers (using FIP) and of the Yankees batters. These columns were labeled `pwar` and `bwar` for pitchers and batter respectively. 
+
+A new column `result` was mutated representing a binary variable that takes 1 if the pitch thrown was a strike and 0 otherwise. The pitches that were considered a strike were those pitches where the result was a swinging strike, called strike, foul, foul tip, foul bunt, and missed bunt.  
+
+```{r, echo = FALSE, message = FALSE}
+#data only for red sox pitchers
+sox <- data %>% filter(team=="Red Sox")
+#add in red sox pitchers' WAR
+pwar <- read.csv("~/Desktop/MSSP/Fall/MA 678/Final/pitcherWAR.csv", header = TRUE)
+pwar <- pwar %>% select(2,7)
+colnames(pwar) <- c("pitcher", "pwar")
+
+sox <- merge(sox, pwar, by = "pitcher") %>% 
+  select("team", "pitcher", "pwar", everything())
+
+#add in yankees batters' WAR
+bwar <- read.csv("~/Desktop/MSSP/Fall/MA 678/Final/bwar.csv", header = TRUE)
+bwar <- bwar %>% select(2,6)
+colnames(bwar) <- c("batter", "bwar")
+
+sox <- merge(sox, bwar, by = "batter") %>% 
+  select("team", "pitcher", "pwar", "batter", "bwar", everything())
+
+#collapse sox data to have unique pitcher, batter combos
+new_data <- sox %>% group_by(pitcher, batter) %>% 
+  summarize(count = n(), 
+            pwar = mean(pwar),
+            bwar = mean(bwar), 
+            prop = sum(result/n()), 
+            velo = mean(velo), 
+            spin = mean(spin), 
+            vbreak = mean(vbreak), 
+            hbreak = mean(hbreak)) %>% 
+  select(-count)
+
+
+```
+
+```{r, echo = FALSE}
+#distribution of proportion of pitches thrown that were strikes, for each pitcher batter combo
+# hist(new_data$prop, xlab = "Proportion of Strikes Thrown")
+#distribution is approximately symmetric so make threshold 50%
+
+#if proportion of pitches thrown is above 0.5, then pitcher has a high proportion of pitches thrown
+new_data$high <- ifelse(new_data$prop>=0.50, 1, 0)
+```
+
+The final step in preparing the data for modeling was to collapse the dataset so that every row represented a unique pitcher-batter combination. For each unique combination, the averages were taken of the variables `pwar`, `bwar`, `velo`, `spin`, `vbreak`, and `hbreak`. A new column `prop` was then created representing the proportion of pitches thrown by the pitcher that were considered a strike. This column was used to create the binary response variable of my analysis labeled `high`. If the proportion of strikes thrown was greater than 0.5, the binary response variable is 1 and is 0 if the proportion of strikes is less than 0.5.
+
+# Exploratory Data Analysis
+
+Before modeling the probability Red Sox pitchers throw high strike proportions against Yankees batters, I conduct some exploratory data analysis to better understand the data. 
+
+I first look at a correlation heatmap to observe the linear relationships between all of the numerical variables. Figure \@ref(fig:heatmap-plot) shows that darker tiles correspond with two variables that have strong negative or positive correlations. The most noticeable tile is that of the vertical break and velocity of the pitch thrown, suggesting the presence of redundant information and multicollinearity. As a result, the vertical break of each pitch will not be included as a variable in the modeling.
+
+```{r heatmap-plot, echo = FALSE, fig.cap = "Correlation heatmap of numerical variables in data set.", out.width = 330, fig.align='center'}
+cormat <- round(cor(new_data[,c(3:4, 6:9)]),2)
+melted_cormat <- melt(cormat)
+ggplot(data = melted_cormat, aes(x=Var1, y=Var2, fill=value)) + 
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1,1), space = "Lab", 
+                       name="Pearson\nCorrelation") +
+  labs(x = NULL, y = NULL) +
+  theme(axis.text = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14))
+```
+\newpage
+
+Next, I look at the distribution of high-strike and low-strike at bats for different Yankees batters with different WARs. Figure \@ref(fig:violin-plot) displays a violin plot to visualize this distribution. The distribution of pitchers who threw high strike proportions appears to take on the same shape as pitchers who threw low strike proportions. However, is this the case for all pitchers? I then looked closer at how high strike proportions varies across different Red Sox pitchers. \
+
+```{r violin-plot, echo = FALSE, fig.cap = "Violin plot of Yankees batters' WAR for high-strike and low-strike at bats.", out.width = 290, fig.align = "center"}
+new_data %>% ggplot(aes(factor(high), bwar, fill = factor(high))) +
+  geom_violin(alpha = 0.5) +
+  scale_fill_manual(values = c("darkgoldenrod2", "deeppink3")) +
+  geom_jitter() +
+  labs(x = "High-Strike", y = "Batter's WAR") +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.position = "none")
+```
+
+\newpage
+
+Figure \@ref(fig:pitcher-plot) now shows varying distributions of high-strike at bats. For some pitchers like Brandon Walter and Tanner Houck, fewer pitches that resulted in strikes are being thrown to Yankees batters with higher WARs. However, for other pitchers like Kenley Jansen and Zack Weiss, more pitches that resulted in strikes are being thrown to batters with higher WARs. It appears that the probability of a pitcher throwing high-strikes against a batter varies across different pitchers suggesting that a multilevel model with varying intercepts and slopes may be an appropriate fit to the data. This can also be seen in Figure \@ref(fig:point-plot) with the varying proportions of high-strikes for each pitcher. \
+
+```{r pitcher-plot, echo = FALSE, warning = FALSE, message = FALSE, fig.cap = "Violin plot of Yankees batters' WAR for high-strike and low-strike at bats across Red Sox pitchers."}
+new_data %>% ggplot(aes(factor(high), bwar, fill = factor(high))) +
+  facet_wrap(~pitcher) +
+  geom_violin(alpha = 0.5) +
+  scale_fill_manual(values = c("darkgoldenrod2", "deeppink3")) +
+  labs(x = "High-Strike", y = "Batter's WAR") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.position = "none")
+
+```
+
+
+```{r point-plot, echo = FALSE, fig.cap = "Proportion of times Red Sox pitchers threw high-strikes in the 2023 regular season against the Yankees.", out.width = 350, fig.align = "center"}
+#proportion of times pitchers had high strikes thrown for each pitcher
+new_data %>% group_by(pitcher) %>% 
+  summarize(high_prop = mean(high)) %>% 
+  ggplot(aes(x = reorder(pitcher, -high_prop), high_prop)) + 
+  geom_point(aes(color = pitcher), size = 4) +
+  theme_bw() + 
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(x = "Pitcher", y = "Proportion of High-Strikes") +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.position = "none")
+
+```
+\newpage
+
+# Models
+
+In this section, I fit and compare different models to the data to predict whether a high strike proportion is thrown to a particular batter while considering other variables. The data was randomly split into training (80%) and testing (20%) datasets where the models were produced from the training dataset and predictions were compared using the testing dataset. The first model I fit was that of the null logistic model, a model with no predictors. The output of the model is below. \
+\
+
+```{r, echo = FALSE}
+#testing and training
+set.seed(100)
+sample <- sample(c(TRUE, FALSE), nrow(new_data), replace=TRUE, prob=c(0.8,0.2))
+training  <- new_data[sample, ]
+testing   <- new_data[!sample, ]
+```
+
+```{r null_mod, echo = FALSE}
+set.seed(100)
+mod1 <- stan_glm(high~1, family = binomial(link = "logit"), data = training, refresh = 0, iter = 1000)
+print(mod1, digits = 4)
+```
+\newpage
+
+The fitted values for this first model can be found from the following equation: $$\frac{1}{1 + e^{-(-0.2333)}} \approx 0.44$$ This value is average of the response variable in the training data set and so is the proportion of times a Red Sox pitcher had a high strike proportion against a Yankees batter.
+
+The second model fit to the data was a logistic model with the predictors of the batter's WAR and characteristics of the pitches thrown to the batter. These variables are the average velocity, spin, and horizontal break of pitches thrown to the batter. This model does not consider the variability by pitcher and so this model is also the complete pooling model. The output of this model is below. \
+\
+
+```{r, echo = FALSE}
+#complete pooling
+set.seed(100)
+mod2 <- stan_glm(high ~ bwar + velo + spin + hbreak, family = binomial(link = "logit"), data = training, refresh = 0, iter = 1000)
+print(mod2, digits = 4)
+```
+\
+\
+The next model considered was that of the partial pooling model where we take into account the varying high strike proportions by pitcher. This model varies the intercepts and slopes. The coefficients can be viewed in Table \@ref(tab:partial-tab).
+
+Using the same partial pooling model, I consider adding a group-level predictor, `pwar`, the WAR of each Red Sox pitcher. The coefficients can be viewed in Table \@ref(tab:partialpred-tab).
+
+Briefly comparing the AIC and BIC of the partial pooling model without a group-level predictor and with the group-level predictor, the AIC only slightly decreases by one unit and the BIC actually increases. As a result, it does not appear that adding the group-level predictor adds to the prediction performance of the model. 
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+#partial pooling, varying intercepts
+mod3 <- glmer(high ~ bwar + velo + spin + hbreak + (1+bwar|pitcher) + (1+velo|pitcher) + (1+spin|pitcher) + (1+hbreak|pitcher), data = training, family = binomial, control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e4)))
+```
+
+```{r echo = FALSE, message = FALSE, warning = FALSE}
+#partial pooling plus group level predictor pwar
+mod4 <- glmer(high ~ bwar + velo + spin + hbreak + pwar + (1+bwar|pitcher) + (1+velo|pitcher) + (1+spin|pitcher) + (1+hbreak|pitcher) + (1+pwar|pitcher), data = training, family = binomial, control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e4)))
+```
+
+```{r, echo = FALSE}
+cat("Without group-level AIC:", extractAIC(mod3)[2])
+cat("With group-level AIC:", extractAIC(mod4)[2])
+cat("Without group-level AIC:", BIC(mod3))
+cat("With group-level AIC:", BIC(mod4))
+```
+
+The last model I consider is a no pooling model where a logistic model is created for each pitcher. The coefficients for each of the 18 models for 18 pitchers are placed in Table \@ref(tab:coef-tab).
+
+```{r echo = FALSE, message = FALSE, warning = FALSE}
+#no pooling
+pitchers <- unique(training$pitcher)
+no_pooling_coefs <- rep(list(list()), length(pitchers))
+no_pooling_mods <- rep(list(list()), length(pitchers))
+no_pool <- function(x){# x is name of pitcher to filter by
+  set.seed(100)
+  return(stan_glm(high ~ bwar + velo + spin + hbreak, family = binomial(link = "logit"), data = subset(training, pitcher == x), refresh = 0, iter = 1000))
+}
+for (i in 1:length(pitchers)){
+  mods <- no_pool(pitchers[i])
+  coefs <- coef(no_pool(pitchers[i]))
+  no_pooling_mods[[i]] <- mods
+  no_pooling_coefs[[i]] <- coefs
+}
+
+models <- do.call(rbind, no_pooling_coefs)
+row.names(models) <- pitchers
+```
+
+## Comparing Models
+
+In this section, I compare the four models (null, complete pooling, partial pooling with varying intercepts, and no pooling) by calculating and comparing the misclassification errors of each model used on the training dataset. The misclassification error for a model is defined as the proportion of false positives and false negatives generated the model. For each calculation the threshold of 0.40 was used to distinguish a high strike plate appearance from a low strike plate appearance. Therefore, if the probabilities from the predictions of the testing dataset were greater than 0.40, that observation would be considered as a high-strike result. The general formula for the misclassification error is then: $$\frac{\sum_{i=1}^n\text{predicted}_i\neq\text{actual}_i}{n}$$ where $n$ is the number of observations in the testing dataset.
+
+For the null model and complete pooling model, the average misclassification error was calculated from the posterior predictive draws of the new data. A function was created to loop through the iterations of the posterior predictions and for each iteration, classify each observation as high-strike (1) or low-strike (0) and calculate the misclassification error. The average of these errors was then taken by dividing by the number of iterations.
+
+The misclassification errors of each model can be viewed in Table \@ref(tab:error-tab).
+
+```{r error-tab, echo = FALSE}
+# #misclassification errors
+misclass <- function(mod, p){
+  fitted <- ifelse(posterior_epred(mod, newdata = testing, type = "response")>p, 1, 0)
+  misclasses <- vector("numeric", nrow(fitted))
+  for (i in 1:nrow(fitted)){
+    prop <- (sum(as.vector(fitted[i,])!=testing$high))/(length(testing$high))
+    misclasses[i] <- prop
+  }
+  return(mean(misclasses))
+}
+
+# #model1
+m1error <- misclass(mod1, 0.40)
+# 
+# #model2
+m2error <- misclass(mod2, 0.40)
+# 
+# #model3
+fitted <- ifelse(predict(mod3, newdata = testing, type = "response")>0.40, 1, 0)
+(m3error <- sum(testing$high!=fitted)/nrow(testing))
+# 
+# #model5
+fitted <- vector("numeric", nrow(testing))
+for(i in 1:nrow(testing)){
+  new_obsv <- testing[i,]
+  name <- new_obsv$pitcher
+  mod_index <- which(name==pitchers)
+  mod <- no_pooling_mods[[mod_index]]
+  prediction <- ifelse(predict(mod, newdata = new_obsv, type = "response")>0.40, 1, 0)
+  fitted[i] <- prediction
+}
+m5error <- sum(testing$high!=fitted)/nrow(testing)
+
+df <- data.frame(Model = c("Null", 
+                           "Complete Pooling",
+                           "Partial Pooling",
+                           "No Pooling"),
+                 `Misclassification Error` = c(round(m1error,4), round(m2error,4), round(m3error,4), round(m5error,4)))
+
+df %>% 
+  kable(format = "latex", booktabs = TRUE, caption = "Misclassification Errors for 4 Models") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>% 
+  kable_classic(html_font = "Cambria")
+```
+
+# Discussion
+
+Simply comparing the misclassification errors of the four models, the partial pooling model with no group-level predictor performs the best with a misclassification error of 39.13%. The model with the highest misclassification error is the no pooling model with over a 10% higher rate than the partial pooling model. The no pooling model creates a separate regression model for each pitcher and assumes that every plate appearance does not share similarities across pitchers. This model assumes no information is shared among the pitchers and each pitcher is considered to be independent from one another. Based on the misclassification error of the no pooling model, it appears that this analysis tends to overfit the data and overstate the variation for each pitcher. 
+
+On the other hand, the complete pooling model ignores the variation between pitchers and produces one model that groups all pitchers together to give one estimate of whether a plate appearance results in a high strike proportion. This model produces the second largest misclassificaiton error of 48.86% as it fails to account the variability of the response variable that was visualized in Figure \@ref(fig:pitcher-plot) and Figure \@ref(fig:point-plot). Additionally, the objective of this analysis was to determine which Red Sox pitchers could throw a high strike proportion against Yankees batters with different WARs and so it would be beneficial to "pool away" this variable.
+
+As a result, a compromise between the extremes of no pooling and complete pooling is the partial pooling model which takes into account the variation of high-strikes within and between pitchers. With the lowest misclassification error, the varying intercept and slopes of this model suggests that the Red Sox pitcher affects the high-strike proportion result and it also influences the effect of the average velocity, average spin, and average horizontal break of the pitches thrown during an at bat as well as the effect of the batter's WAR. 
+
+With this model, we can make predictions for new observations. For example, say we want to predict the probability that Red Sox pitcher Kenley Jansen throws a high strike proportion against Yankees player Kyle Higashioka in the 2023 regular season. Kyle Higashioka has a WAR of 1.7 and say the average velocity, spin, and horizontal break of the pitches thrown to Higashioka are 93.0, 2300, and 5 respectively. Then the probability of Kenley Jansen throwing more pitches that result in strikes to Kyle Higashioka during one plate appearance can be determined from the following: $$\begin{aligned}P(y = 1) &= \frac{1}{1+e^{-X\beta}}\\&=\frac{1}{1+e^{-[-7.19+(0.32*1.7)+(0.05*93)+(0.001*2300)+(0.02*5)]}}\\&=\frac{1}{1+e^{-0.82}}\\&\approx0.6952\end{aligned}$$ This result suggests that the estimated probability of Kenley Jansen throwing more pitches that result in strikes against Kyle Higashioka during a plate appearance is about 70%. We can compare this to another pitcher. What is the probability of Red Sox pitcher Chris Martin throwing a high-strike proportion against Higashioka with the same average stats? Now using the coefficients associated with Chris Martin, $$\begin{aligned}P(y = 1) &= \frac{1}{1+e^{-X\beta}}\\&=\frac{1}{1+e^{-[-8.10+(-0.05*1.7)+(0.05*93)+(0.001*2300)+(0.04*5)]}}\\&=\frac{1}{1+e^{-(-0.80)}}\\&\approx0.3091\end{aligned}$$ This result suggests that the estimated probability of Chris Martin throwing more pitches that result in strikes against Kyle Higashioka is about 31%, about 40% less than if Kenley Jansen were to pitch.
+
+```{r, echo = FALSE}
+#predictions
+#kenley jansen
+coefs <- c(-7.189097, 0.32173660, 0.05360815, 0.0010302585, 0.02228718)
+new <- c(1, 1.7, 93, 2300, 5)
+phat <- 1/(1+exp(-coefs%*%new)) #0.7370
+#Chris Martin
+coefs <- c(-8.103947, -0.04550731, 0.05328095, 0.0009696635, 0.03833361)
+new <- c(1, 1.7, 93, 2300, 5)
+phat <- 1/(1+exp(-coefs%*%new)) #0.3520
+```
+
+Although this partial pooling model produces the lowest misclassification error rate, it is still much larger than those error rates seen from machine learning and random forest classification. For future work, more predictors that have stronger relationships with strike proportion could be added to this partial pooling logistic model. For example, one important factor that could be included is the handedness of the pitcher and batter. Lefty-lefty and righty-righty matchups are favorable to the pitcher as their breaking pitches will curve away from the batter. Other batter statistics could also be added to the model like On-base Plus Slugging (OPS) to improve predictions from increased opponent information.
+
+
+\newpage
+# Appendix 
+
+```{r prop-fig, echo = FALSE, fig.cap="Histogram of proportion of strikes thrown by Red Sox pitchers against a Yankees batter. The distribution is approximately symmetrical. As a result, pitchers with a strike proportion greater than 0.5 will be labeled as having a high strike proportion against a Yankees batter."}
+hist(new_data$prop, xlab = "Proportion of Strikes Thrown", main = NULL)
+
+```
+
+```{r partial-tab, echo = FALSE, message = FALSE, warning = FALSE}
+coef(mod3)$pitcher %>% 
+  kable(format = "latex", booktabs = TRUE, caption = "Coefficients for partial pooling models by pitcher") %>% 
+  kable_styling(latex_options="scale_down", bootstrap_options = c("striped", "hover", "condensed")) %>% 
+  kable_classic(html_font = "Cambria")
+```
+
+```{r partialpred-tab, echo = FALSE, warning = FALSE, message = FALSE}
+coef(mod4)$pitcher %>% 
+  kable(format = "latex", booktabs = TRUE, caption = "Coefficients for partial pooling models with group-level predictor by pitcher") %>% 
+  kable_styling(latex_options="scale_down", bootstrap_options = c("striped", "hover", "condensed")) %>% 
+  kable_classic(html_font = "Cambria")
+```
+
+```{r coef-tab, echo = FALSE}
+models %>% 
+  kable(format = "latex", booktabs = TRUE, caption = "Coefficients for no pooling models by pitcher") %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>% 
+  kable_classic(html_font = "Cambria")
+```
+
+
+
+
+
+
+
+
+
+
+
